@@ -1,6 +1,7 @@
 from argparse import ArgumentError, ArgumentTypeError
 from typing import cast
 import arkouda as ak
+from scipy.sparse import coo_array
 
 class SparseMatrix:
     """ The parent class for COO, CSR, and CSC sparse matrix formats. 
@@ -13,6 +14,27 @@ class SparseMatrix:
 
     def __repr__(self):
         return f"D: {self.data}, C: {self.columns}, R: {self.rows}"
+
+    def _to_scipy_sparse(self, sparse_format="csr"):
+        import importlib
+
+        try:
+            sp = importlib.import_module("scipy.sparse")
+        except ImportError:
+            raise ImportError("scipy is required to convert sparse matrices to SciPy objects")
+
+        coo = self.to_coo()
+        values = coo.data.to_ndarray()
+        rows = coo.rows.to_ndarray()
+        columns = coo.columns.to_ndarray()
+
+        ret_coo = coo_array((values, (rows, columns)), shape=self.shape)
+        if sparse_format == "csr":
+            return ret_coo.tocsr()
+        elif sparse_format == "csc":
+            return ret_coo.tocsc()
+        else:
+            return ret_coo
 
     def _binop(self, other, binop):
         # Supported types for arithmetic operations
@@ -127,7 +149,7 @@ class SparseMatrix:
 class Coo(SparseMatrix):
     """ Coordinate Format (COO) """
 
-    def __init__(self, data=None, columns=None, rows=None, shape=None, no_chpl=None, from_csr=None, from_csc=None):
+    def __init__(self, data=None, columns=None, rows=None, shape=None, no_chpl=True, from_csr=None, from_csc=None):
         self.data = None
         self.columns = None
         self.rows = None
@@ -137,7 +159,7 @@ class Coo(SparseMatrix):
             self.rows = rows
             self.columns = columns
             self.shape = shape
-            sorting_gb = ak.GroupBy([self.rows, self.columns])
+            sorting_gb = ak.GroupBy([self.columns, self.rows]) if from_csc else ak.GroupBy([self.rows, self.columns])
             self.data = data[sorting_gb.permutation]
         else:
             resp = cast(str, ak.client.generic_msg(cmd="coo_construct", args={"data": data, "columns": columns, "rows": rows}))
@@ -150,10 +172,10 @@ class Coo(SparseMatrix):
     def to_coo(self):
         return self
 
-    def to_csr(self, no_chpl=None):
+    def to_csr(self, no_chpl=True):
         return Csr(self.data, self.columns, self.rows, self.shape, no_chpl)
 
-    def to_csc(self, no_chpl=None):
+    def to_csc(self, no_chpl=True):
         return Csc(self.data, self.columns, self.rows, self.shape, no_chpl)
 
     # Arithmetic operation functions ---------------------------------------------------
@@ -212,7 +234,7 @@ class Coo(SparseMatrix):
 class Csr(SparseMatrix):
     """ Compressed Sparse Row """
 
-    def __init__(self, data, columns, rows, shape, no_chpl=None, finished_vals=False):
+    def __init__(self, data, columns, rows, shape, no_chpl=True, finished_vals=False):
         if not no_chpl:
             resp = cast(str, ak.client.generic_msg(cmd="coo_to_csr", args={"data": data, "columns": columns, "rows": rows, "shape_width": shape[0], "shape_height": shape[1]}))
             arr_ids = resp.split("+")
@@ -238,17 +260,17 @@ class Csr(SparseMatrix):
 
             self._gb_row_col = ak.GroupBy([rows, columns])
             self._gb_row = ak.GroupBy(rows)
-            self.data = data
-            self.indices = columns
-            self._gb_row_val = ak.GroupBy([rows, data])
-            self._gb_row_val_uk = ak.GroupBy(self._gb_row_val.unique_keys[0])
+            # sort data/indices into row-major order so indptr offsets line up with them
+            self.data = data[self._gb_row_col.permutation]
+            self.indices = columns[self._gb_row_col.permutation]
+            self._gb_row_col_uk = ak.GroupBy(self._gb_row_col.unique_keys[0])
 
             self.shape = shape
 
-            segs = ak.concatenate([self._gb_row_val_uk.segments, ak.array([len(self.data)])])
+            segs = ak.concatenate([self._gb_row_col_uk.segments, ak.array([len(self.data)])])
             diffs = segs[1:] - segs[:-1]
             ind_ptr = ak.zeros(shape[1] + 1, ak.int64)
-            ind_ptr[self._gb_row_val_uk.unique_keys + 1] = diffs
+            ind_ptr[self._gb_row_col_uk.unique_keys + 1] = diffs
             ind_ptr = ak.cumsum(ind_ptr)
             for i in range(shape[1] - (len(ind_ptr) - 1)):
                 ind_ptr = ak.concatenate([ind_ptr, ind_ptr[-1:]])
@@ -258,13 +280,19 @@ class Csr(SparseMatrix):
         return f"D: {self.data}, C: {self.indices}, R: {self.indptr}"
 
     # Format conversion functions ---------------------------------------------------
-    def to_coo(self, no_chpl=None):
+    def to_coo(self, no_chpl=True):
         return Coo(data=self.data, columns=self._old_columns, rows=self._old_rows, shape=self.shape, from_csr=True)
 
     def to_csr(self):
         return self
 
-    def to_csc(self, no_chpl=None):
+    def to_scipy_sparse(self, sparse_format="csr"):
+        return self._to_scipy_sparse(sparse_format)
+
+    def __eq__(self, other):
+        return self._scipy_sparse_equal(other)
+
+    def to_csc(self, no_chpl=True):
         temp_coo = Coo(data=self.data, columns=self._old_columns, rows=self._old_rows, shape=self.shape, from_csr=True)
         return temp_coo.to_csc()
 
@@ -338,7 +366,7 @@ class Csr(SparseMatrix):
 class Csc(SparseMatrix):
     """ Compressed Sparse Column """
 
-    def __init__(self, data, columns, rows, shape, no_chpl=None):
+    def __init__(self, data, columns, rows, shape, no_chpl=True):
         if not no_chpl:
             resp = cast(str, ak.client.generic_msg(cmd="coo_to_csc", args={"data": data, "columns": columns, "rows": rows, "shape_width": shape[0], "shape_height": shape[1]}))
             arr_ids = resp.split("+")
@@ -383,15 +411,21 @@ class Csc(SparseMatrix):
         return f"D: {self.data}, C: {self.indptr}, R: {self.indices}"
     
     # Format conversion functions ---------------------------------------------------
-    def to_coo(self, no_chpl=None):
+    def to_coo(self, no_chpl=True):
         return Coo(data=self._old_data, columns=self._old_columns, rows=self._old_rows, shape=self.shape, from_csc=True)
 
-    def to_csr(self, no_chpl=None):
+    def to_csr(self, no_chpl=True):
         temp_coo = Coo(data=self._old_data, columns=self._old_columns, rows=self._old_rows, shape=self.shape, from_csc=True)
         return temp_coo.to_csr()
 
     def to_csc(self):
         return self
+
+    def to_scipy_sparse(self, sparse_format="csc"):
+        return self._to_scipy_sparse(sparse_format)
+
+    def __eq__(self, other):
+        return self._scipy_sparse_equal(other)
 
     # Arithmetic operation functions ---------------------------------------------------
     def plus_scalar(self, scalar):
@@ -447,7 +481,7 @@ class Csc(SparseMatrix):
         else:
             raise ArgumentTypeError
 
-    def spgemm(self, other, no_chpl=None):
+    def spgemm(self, other, no_chpl=True):
         if not no_chpl:
             resp = cast(str, ak.client.generic_msg(cmd="spgemm", args={"self_data": self.data, "other_indptr" : other.indptr, "other_data" : other.data, "self_shape_width": self.shape[0], "self_shape_height" : self.shape[1], "other_shape_width" : other.shape[0], "other_shape_height" : other.shape[1], "self_gb_rep" : self._gb_col_row, "other_gb_rep" : other._gb_row_col, "cname": self._cname, "rname": self._rname}));
             arr_ids = resp.split("+")
@@ -465,22 +499,25 @@ class Csc(SparseMatrix):
             ends = other.indptr[self._gb_col_row.unique_keys[0] + 1]
 
             fullsize = (ends - starts).sum()
-            nonzero = (ends > starts)
-
-            lengths = (ends - starts)
-            segs = ak.cumsum(lengths) - lengths
+            lengths = ends - starts
+            fullsegs = ak.cumsum(lengths) - lengths
             totlen = lengths.sum()
-            slices = ak.ones(totlen, dtype=ak.akint64)
-            diffs = ak.concatenate((ak.array([starts[0]]), starts[1:] - starts[:-1] - (lengths[:-1] - 1)))
-            slices[segs] = diffs
-            fullsegs, ranges =  segs, ak.cumsum(slices)
+            slices = ak.ones(totlen, dtype=ak.int64)
 
-            # fullsegs, ranges = ak.gen_ranges(starts[nonzero], ends[nonzero])
+            # jump offsets must be computed only between real (non-empty) segments, otherwise
+            # a zero-length segment's unrelated starts/ends corrupt the next real segment's jump
+            nonzero = ends > starts
+            real_starts = starts[nonzero]
+            real_lengths = lengths[nonzero]
+            diffs = ak.concatenate((ak.array([real_starts[0]]), real_starts[1:] - real_starts[:-1] - (real_lengths[:-1] - 1)))
+            slices[fullsegs[nonzero]] = diffs
+            ranges = ak.cumsum(slices)
+
             fullBdom = other._gb_row_col.unique_keys[1][ranges]
-            fullAdom = ak.broadcast(fullsegs, self._gb_col_row.unique_keys[1][nonzero], fullsize)
+            fullAdom = ak.broadcast(fullsegs, self._gb_col_row.unique_keys[1], fullsize)
 
             fullBval = other.data[ranges]
-            fullAval = ak.broadcast(fullsegs, self.data[nonzero], fullsize)
+            fullAval = ak.broadcast(fullsegs, self.data, fullsize)
 
             fullprod = fullAval * fullBval
             proddomGB = ak.GroupBy([fullAdom, fullBdom])
